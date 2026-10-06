@@ -20,6 +20,9 @@ from .schemas import (
     ErrorDetail,
     ImpactedVersion,
     KeyRotationResponse,
+    LicenseChangeBatchRequest,
+    LicenseChangeBatchResponse,
+    LicenseChangeBatchResult,
     LicenseChangeRequest,
     LicenseChangeResponse,
     PermissionResponse,
@@ -234,6 +237,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_change(change_id: str, request: Request) -> LicenseChangeResponse:
         return LicenseChangeResponse(**service_from(request).get_change(change_id))
+
+    @app.post(
+        "/license-changes/batches",
+        response_model=LicenseChangeBatchResponse,
+        status_code=201,
+        tags=["license-changes"],
+        summary="在同一事务内按序导入多条许可变更，逐条呈现真实订阅翻转（整批原子、幂等）",
+        responses={
+            200: {"description": "同批次标识与规范化后完全相同的列表重试，返回首次冻结结果"},
+            201: {"description": "批次首次提交：全部变更与翻转事件在同一事务落库"},
+            404: {"description": "批次内存在未知版本，整批拒绝且不落任何库"},
+            409: {"description": "批内标识重复、与已存记录冲突或同版本同时刻冲突，或批次标识复用内容不同"},
+            422: {"description": "变更列表为空或任一字段非法（含无时区时刻、空用途），整批拒绝"},
+        },
+    )
+    def submit_changes_batch(
+        payload: LicenseChangeBatchRequest, request: Request
+    ) -> JSONResponse | LicenseChangeBatchResponse:
+        result, replayed = service_from(request).submit_changes_batch(
+            batch_id=payload.batch_id,
+            items=[item.model_dump() for item in payload.changes],
+        )
+        body = LicenseChangeBatchResponse(
+            replayed=replayed,
+            batch=LicenseChangeBatchResult(**result),
+        )
+        if replayed:
+            # 200 OK makes an idempotent batch retry distinguishable from the
+            # first commit; events are never replayed.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/license-changes/batches/{batch_id}",
+        response_model=LicenseChangeBatchResult,
+        tags=["license-changes"],
+        summary="按批次标识取回首次冻结的批次结果（逐条变更与新增事件数）",
+        responses={404: {"description": "批次不存在"}},
+    )
+    def get_batch(batch_id: str, request: Request) -> LicenseChangeBatchResult:
+        return LicenseChangeBatchResult(
+            **service_from(request).get_batch(batch_id)
+        )
 
     @app.post(
         "/license-changes/preview",

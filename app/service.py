@@ -54,6 +54,26 @@ def content_hash(version_id: str, effective_at: str, allowed_uses: list[str]) ->
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def batch_content_hash(items: list[dict[str, Any]]) -> str:
+    """Stable hash of a batch's ordered, normalised change list.
+
+    A batch retry is identical only when the list is the same after the
+    single-change normalisation (trimmed/deduplicated uses, UTC instants) in
+    the SAME order. Explicitly omitted change ids are normalised to null.
+    """
+    payload = [
+        {
+            "change_id": item["change_id"],
+            "version_id": item["version_id"],
+            "effective_at": item["effective_at"],
+            "allowed_uses": sorted(set(item["allowed_uses"])),
+        }
+        for item in items
+    ]
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 # -- domain errors ---------------------------------------------------------
 
 
@@ -216,6 +236,68 @@ def _thaw_baseline(blob: str) -> dict[str, Any]:
     return {
         "allowed": bool(data["allowed"]),
         "blockers": _blockers_from_jsonable(data["blockers"]),
+    }
+
+
+def _freeze_batch_result(result: dict[str, Any]) -> str:
+    """Freeze a batch import's first result verbatim (datetimes -> canonical).
+
+    The frozen snapshot is the single source returned by every identical
+    retry, so the response stays byte-for-byte stable even if a change is
+    revoked or otherwise evolves later (change rows themselves remain
+    immutable; only their revocation marker is live).
+    """
+    payload = {
+        "batch_id": result["batch_id"],
+        "created_at": to_canonical(result["created_at"]),
+        "change_count": result["change_count"],
+        "new_event_count": result["new_event_count"],
+        "changes": [
+            {
+                "index": entry["index"],
+                "replayed": entry["replayed"],
+                "change": {
+                    "change_id": entry["change"]["change_id"],
+                    "version_id": entry["change"]["version_id"],
+                    "effective_at": to_canonical(entry["change"]["effective_at"]),
+                    "allowed_uses": list(entry["change"]["allowed_uses"]),
+                    "content_hash": entry["change"]["content_hash"],
+                    "created_at": to_canonical(entry["change"]["created_at"]),
+                    "revocation": None,
+                },
+                "new_event_count": entry["new_event_count"],
+            }
+            for entry in result["changes"]
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _thaw_batch_result(blob: str) -> dict[str, Any]:
+    """Inverse of :func:`_freeze_batch_result` for replay/GET responses."""
+    data = json.loads(blob)
+    return {
+        "batch_id": data["batch_id"],
+        "created_at": parse_canonical(data["created_at"]),
+        "change_count": int(data["change_count"]),
+        "new_event_count": int(data["new_event_count"]),
+        "changes": [
+            {
+                "index": int(entry["index"]),
+                "replayed": bool(entry["replayed"]),
+                "change": {
+                    "change_id": entry["change"]["change_id"],
+                    "version_id": entry["change"]["version_id"],
+                    "effective_at": parse_canonical(entry["change"]["effective_at"]),
+                    "allowed_uses": list(entry["change"]["allowed_uses"]),
+                    "content_hash": entry["change"]["content_hash"],
+                    "created_at": parse_canonical(entry["change"]["created_at"]),
+                    "revocation": None,
+                },
+                "new_event_count": int(entry["new_event_count"]),
+            }
+            for entry in data["changes"]
+        ],
     }
 
 
@@ -461,6 +543,258 @@ class LicenseService:
         # the same record rather than hiding it.
         revocation = self.db.get_revocation_of_change(change_id)
         return _change_out(row, revocation)
+
+    # -- batch license changes --------------------------------------------
+
+    def submit_changes_batch(
+        self,
+        batch_id: str | None,
+        items: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Import an ordered, non-empty list of license changes in one batch.
+
+        Returns ``(batch_result, replayed)``. Every item reuses the single
+        change semantics: explicit change id, version, timezone-aware
+        effective instant and the allowed-use full set. The ENTIRE batch is
+        rejected (no change row, no batch row, no event) when any item is
+        illegal: duplicate change id inside the batch, a change id that
+        already exists with different content, a different change at the same
+        (version, effective instant) either inside the batch or in storage, or
+        an unknown version.
+
+        All items apply in REQUEST ORDER inside ONE write transaction; after
+        each insert the affected subscriptions are re-evaluated against a
+        snapshot that already contains the earlier items of this batch, so a
+        later item can flip a subscription back — both flips append their own
+        events with consecutive per-subscription sequence numbers.
+
+        A retry with the same ``batch_id`` and an identical normalised list
+        returns the frozen first result without applying or replaying
+        anything; the same id with different content is a conflict.
+        """
+        if not items:
+            # The HTTP schema enforces this too; keep the service contract.
+            raise ServiceError("变更列表不能为空")
+
+        batch_id = batch_id or f"b-{uuid.uuid4().hex}"
+
+        # Normalise every item exactly like a single submission; this hash (and
+        # every validation below) therefore matches the single-change rules.
+        normalised: list[dict[str, Any]] = []
+        for pos, item in enumerate(items):
+            effective_dt = item["effective_at"]
+            if not isinstance(effective_dt, datetime) or effective_dt.tzinfo is None:
+                raise InvalidTimeError(
+                    f"第 {pos} 条变更的生效时刻必须带时区信息",
+                    {"index": str(pos)},
+                )
+            effective = to_canonical(effective_dt)
+            # Same normalisation as submit_change: trim/drop blank uses,
+            # deduplicate (an empty set is a legal deny-all change); ids are
+            # taken verbatim (a blank/None id triggers server generation).
+            uses = sorted({u.strip() for u in item["allowed_uses"] if u.strip()})
+            version_id = item["version_id"]
+            change_id = item.get("change_id") or None
+            normalised.append(
+                {
+                    "index": pos,
+                    "change_id": change_id,
+                    "version_id": version_id,
+                    "effective_at": effective,
+                    "allowed_uses": uses,
+                    "digest": content_hash(version_id, effective, uses),
+                }
+            )
+
+        digest = batch_content_hash(normalised)
+
+        with self.db.lock:
+            existing_batch = self.db.get_batch(batch_id)
+            if existing_batch is not None:
+                if existing_batch["content_hash"] != digest:
+                    raise ConflictError(
+                        "同一批次标识已存在但变更列表内容不同（批次标识不可复用指向不同内容）",
+                        {"batch_id": batch_id},
+                    )
+                # An identical retry returns the frozen first result; nothing
+                # is applied again and no event is ever replayed.
+                return _thaw_batch_result(existing_batch["result_json"]), True
+
+            # Whole-batch pre-validation: every illegal item rejects the batch
+            # before the write transaction inserts anything.
+            seen_change_ids: set[str] = set()
+            seen_version_times: set[tuple[str, str]] = set()
+            missing_versions: list[str] = []
+            for entry in normalised:
+                if entry["change_id"] is not None:
+                    if entry["change_id"] in seen_change_ids:
+                        raise ConflictError(
+                            "批次内变更标识重复，整批拒绝",
+                            {"batch_id": batch_id, "change_id": entry["change_id"],
+                             "index": str(entry["index"])},
+                        )
+                    seen_change_ids.add(entry["change_id"])
+                version_time = (entry["version_id"], entry["effective_at"])
+                if version_time in seen_version_times:
+                    raise ConflictError(
+                        "批次内同一版本在同一生效时刻存在不同变更，整批拒绝",
+                        {"batch_id": batch_id, "version_id": entry["version_id"],
+                         "effective_at": entry["effective_at"],
+                         "index": str(entry["index"])},
+                    )
+                seen_version_times.add(version_time)
+                if self.db.get_version(entry["version_id"]) is None:
+                    missing_versions.append(entry["version_id"])
+            if missing_versions:
+                raise NotFoundError(
+                    "批次内存在未知版本，整批拒绝",
+                    {"batch_id": batch_id,
+                     "missing_version_ids": ",".join(sorted(set(missing_versions)))},
+                )
+
+            # Conflict checks against stored changes.
+            for entry in normalised:
+                change_id = entry["change_id"]
+                if change_id is not None:
+                    existing_change = self.db.get_change(change_id)
+                    if existing_change is not None:
+                        same = (
+                            existing_change["version_id"] == entry["version_id"]
+                            and existing_change["effective_at"] == entry["effective_at"]
+                            and existing_change["content_hash"] == entry["digest"]
+                        )
+                        if not same:
+                            raise ConflictError(
+                                "相同变更标识已存在但内容不同，整批拒绝",
+                                {"batch_id": batch_id, "change_id": change_id,
+                                 "index": str(entry["index"])},
+                            )
+                # A different stored change at the same (version, instant)
+                # conflicts exactly as in the single-submit path — even when
+                # the allowed-use set matches. The only non-conflict is the
+                # entry replaying the very change sitting at that instant.
+                twin = self.db.change_at_same_time(
+                    entry["version_id"], entry["effective_at"]
+                )
+                if twin is not None and twin["change_id"] != change_id:
+                    raise ConflictError(
+                        "该版本在同一生效时刻已存在不同变更，整批拒绝",
+                        {"batch_id": batch_id, "version_id": entry["version_id"],
+                         "effective_at": entry["effective_at"],
+                         "existing_change_id": twin["change_id"],
+                         "submitted_change_id": change_id,
+                         "index": str(entry["index"])},
+                    )
+
+            created = to_canonical(now_utc())
+            try:
+                self.db.begin()
+                # A concurrent first-writer may have won the batch id under
+                # contention; re-check inside the write transaction.
+                raced_batch = self.db.get_batch(batch_id)
+                if raced_batch is not None:
+                    if raced_batch["content_hash"] != digest:
+                        raise ConflictError(
+                            "同一批次标识已存在但变更列表内容不同（批次标识不可复用指向不同内容）",
+                            {"batch_id": batch_id},
+                        )
+                    self.db.rollback()
+                    return _thaw_batch_result(raced_batch["result_json"]), True
+
+                results: list[dict[str, Any]] = []
+                total_new_events = 0
+                for entry in normalised:
+                    change_id = entry["change_id"]
+                    version_id = entry["version_id"]
+                    effective = entry["effective_at"]
+                    uses = entry["allowed_uses"]
+                    item_digest = entry["digest"]
+
+                    stored = (
+                        self.db.get_change(change_id)
+                        if change_id is not None
+                        else None
+                    )
+                    if stored is not None:
+                        # Passed pre-validation: same id AND identical content.
+                        # A replay changes nothing and appends no events.
+                        item_replayed = True
+                        item_events = 0
+                    else:
+                        # A new (possibly auto-generated) change id. Same-time
+                        # twins against earlier batch items were rejected
+                        # pre-validation; insert and propagate flips.
+                        if change_id is None:
+                            change_id = f"c-{uuid.uuid4().hex}"
+                        self.db.insert_change(
+                            change_id, version_id, effective, uses,
+                            item_digest, created,
+                        )
+                        # Re-pin the snapshot AFTER this insert within the SAME
+                        # transaction: earlier batch items are visible to this
+                        # item's subscription re-evaluation, so a flip caused by
+                        # item N and flipped back by item N+1 yields two events.
+                        snapshot = self._capture_snapshot(manage_transaction=False)
+                        item_events = self._propagate_subscription_flips(
+                            snapshot=snapshot,
+                            root_version_id=version_id,
+                            trigger_kind="license_change",
+                            trigger_id=change_id,
+                            change_id=change_id,
+                            effective_at=effective,
+                        )
+                        item_replayed = False
+                        stored = self.db.get_change(change_id)
+                        assert stored is not None
+
+                    total_new_events += item_events
+                    results.append(
+                        {
+                            "index": entry["index"],
+                            "replayed": item_replayed,
+                            "change": _change_out(stored),
+                            "new_event_count": item_events,
+                        }
+                    )
+
+                batch_result = {
+                    "batch_id": batch_id,
+                    "created_at": parse_canonical(created),
+                    "change_count": len(results),
+                    "new_event_count": total_new_events,
+                    "changes": results,
+                }
+                self.db.insert_batch(
+                    batch_id=batch_id,
+                    content_hash=digest,
+                    created_at=created,
+                    result_json=_freeze_batch_result(batch_result),
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raced_batch = self.db.get_batch(batch_id)
+                if raced_batch is not None:
+                    if raced_batch["content_hash"] == digest:
+                        return _thaw_batch_result(raced_batch["result_json"]), True
+                    raise ConflictError(
+                        "同一批次标识已存在但变更列表内容不同（批次标识不可复用指向不同内容）",
+                        {"batch_id": batch_id},
+                    ) from None
+                raise
+
+            stored_batch = self.db.get_batch(batch_id)
+            assert stored_batch is not None
+            return _thaw_batch_result(stored_batch["result_json"]), False
+
+    def get_batch(self, batch_id: str) -> dict[str, Any]:
+        """Return the frozen first result of a batch import by its id."""
+        row = self.db.get_batch(batch_id)
+        if row is None:
+            raise NotFoundError(
+                "许可变更批次不存在", {"batch_id": batch_id}
+            )
+        return _thaw_batch_result(row["result_json"])
 
     # -- change revocations ----------------------------------------------
 
@@ -1098,7 +1432,7 @@ class LicenseService:
         trigger_id: str,
         change_id: str,
         effective_at: str,
-    ) -> None:
+    ) -> int:
         """Re-evaluate affected subscriptions and append flips in-transaction.
 
         Runs INSIDE the caller's open write transaction, with ``snapshot``
@@ -1111,16 +1445,20 @@ class LicenseService:
         are atomic. Per-subscription sequence numbers start at 1 and grow by
         exactly one per flip; the process lock plus one write transaction
         guarantee no flip is missed or counted twice under concurrency.
+
+        Returns the number of flip events appended (summed over every affected
+        subscription); batch imports report this per change.
         """
         affected = snapshot.descendants_of(root_version_id)
         candidates = self.db.list_subscriptions_for_versions(affected)
         if not candidates:
-            return
+            return 0
 
         last_events = self.db.latest_subscription_events(
             [row["subscription_id"] for row in candidates]
         )
         created = to_canonical(now_utc())
+        event_count = 0
         for sub in candidates:
             last = last_events.get(sub["subscription_id"])
             if last is None:
@@ -1170,6 +1508,8 @@ class LicenseService:
                 ),
                 created_at=created,
             )
+            event_count += 1
+        return event_count
 
     @staticmethod
     def _subscription_out(row: dict[str, Any]) -> dict[str, Any]:

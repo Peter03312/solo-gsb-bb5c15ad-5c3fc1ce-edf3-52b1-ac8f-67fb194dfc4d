@@ -58,6 +58,20 @@ SCHEMA_STATEMENTS = [
         created_at    TEXT NOT NULL
     )
     """,
+    # A batch import submits a non-empty ordered list of license changes under
+    # one unique batch id. The whole batch either commits (every change plus the
+    # subscription flip events it caused) or is rejected without a single row.
+    # The first result is frozen verbatim: an identical retry (same batch id
+    # and normalised list) returns it without re-applying anything or replaying
+    # events; reusing the id with different content conflicts.
+    """
+    CREATE TABLE IF NOT EXISTS license_change_batches (
+        batch_id     TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        result_json  TEXT NOT NULL
+    )
+    """,
     # A permission voucher freezes one permission decision as a traceable
     # credential: the normalised request inputs (version, trimmed use, UTC
     # instant) live in columns for idempotency/conflict checks, while the full
@@ -324,6 +338,28 @@ class Database:
             "WHERE lc.version_id = ? AND lc.effective_at <= ? AND cr.change_id IS NULL "
             "ORDER BY lc.effective_at DESC, lc.change_id LIMIT 1",
             (version_id, at),
+        )
+
+    # -- license change batches -------------------------------------------
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM license_change_batches WHERE batch_id = ?",
+            (batch_id,),
+        )
+
+    def insert_batch(
+        self,
+        batch_id: str,
+        content_hash: str,
+        created_at: str,
+        result_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO license_change_batches "
+            "(batch_id, content_hash, created_at, result_json) "
+            "VALUES (?, ?, ?, ?)",
+            (batch_id, content_hash, created_at, result_json),
         )
 
     # -- change revocations ----------------------------------------------

@@ -69,6 +69,38 @@ class LicenseChangeRequest(BaseModel):
         return _normalise_uses(values)
 
 
+class LicenseChangeBatchItem(BaseModel):
+    """批量导入中的单条变更，字段口径与单条提交完全一致。"""
+
+    change_id: str | None = Field(
+        default=None, min_length=1, max_length=128, description="变更标识；省略时自动生成 UUID"
+    )
+    version_id: str = Field(min_length=1, description="变更所属的已登记版本")
+    effective_at: datetime = Field(description="UTC 生效时刻（必须带时区）")
+    allowed_uses: list[str] = Field(description="该次变更后允许的用途全集（按全集覆盖）")
+
+    _check_time = field_validator("effective_at")(_ensure_aware)
+
+    @field_validator("allowed_uses")
+    @classmethod
+    def _uses(cls, values: list[str]) -> list[str]:
+        return _normalise_uses(values)
+
+
+class LicenseChangeBatchRequest(BaseModel):
+    """一次批量许可变更导入：唯一批次标识 + 非空有序变更列表。"""
+
+    batch_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="唯一批次标识；省略时自动生成 UUID（自动生成标识无法用于重试幂等）",
+    )
+    changes: list[LicenseChangeBatchItem] = Field(
+        min_length=1, description="非空、按请求顺序逐条应用的变更列表"
+    )
+
+
 # -- responses -------------------------------------------------------------
 
 
@@ -188,6 +220,40 @@ class CreateResponse(BaseModel):
     replayed: bool
     change: LicenseChangeResponse | None = None
     version: VersionResponse | None = None
+
+
+class LicenseChangeBatchChangeResult(BaseModel):
+    """批次内单条变更的应用结果（按请求顺序返回）。"""
+
+    index: int = Field(description="该条在请求列表中的从 0 起序号")
+    replayed: bool = Field(
+        description="该变更标识与内容此前已存在时为 true（本次为重放，不新增事件）"
+    )
+    change: LicenseChangeResponse
+    new_event_count: int = Field(
+        ge=0, description="该条应用时为所有受影响订阅新增的翻转事件总数；重放为 0"
+    )
+
+
+class LicenseChangeBatchResult(BaseModel):
+    """批次首次结果的冻结内容（不含顶层 replayed 标记）。"""
+
+    batch_id: str = Field(description="唯一批次标识")
+    created_at: datetime = Field(description="批次首次提交时间（服务按 UTC 生成）")
+    change_count: int = Field(ge=1, description="批次内变更条数")
+    new_event_count: int = Field(
+        ge=0, description="整个批次为所有受影响订阅新增的翻转事件总数"
+    )
+    changes: list[LicenseChangeBatchChangeResult] = Field(
+        description="按请求顺序逐条返回的变更结果"
+    )
+
+
+class LicenseChangeBatchResponse(BaseModel):
+    replayed: bool = Field(
+        description="同批次标识与规范化后完全相同的列表重试时为 true，返回首次冻结结果且不重放事件"
+    )
+    batch: LicenseChangeBatchResult
 
 
 # -- permission vouchers ---------------------------------------------------

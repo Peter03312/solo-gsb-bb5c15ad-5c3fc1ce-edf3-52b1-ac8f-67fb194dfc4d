@@ -192,6 +192,75 @@ say "订阅错误 4：未知订阅标识（GET/事件流）-> 404"
 curl -s "$BASE/permissions/subscriptions/no-such-subscription"; echo
 curl -s "$BASE/permissions/subscriptions/no-such-subscription/events"; echo
 
+say "批量许可变更：自包含示例版本 batch-demo-v1 先登记并提交 2026-03 起仅 research"
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"batch-demo-v1","parent_ids":[],"note":"批量许可变更调用示例"}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"batch-demo-c1","version_id":"batch-demo-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null || true
+
+say "建立订阅：关注 batch-demo-v1 在 2026-11 固定时刻对 review 的许可（基线拒绝）"
+curl -s -X POST "$BASE/permissions/subscriptions" -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"example-batch-sub","version_id":"batch-demo-v1","use":"review","at":"2026-11-01T00:00:00Z"}' >/dev/null || true
+
+say "批量导入（同一事务按序应用）：6 月放开 review（拒绝->允许）、8 月再收紧（允许->拒绝），两次真实翻转都留痕，201"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "example-batch-1",
+    "changes": [
+      {"change_id":"batch-demo-c2","version_id":"batch-demo-v1","effective_at":"2026-06-01T00:00:00Z","allowed_uses":["research","review"]},
+      {"change_id":"batch-demo-c3","version_id":"batch-demo-v1","effective_at":"2026-08-01T00:00:00Z","allowed_uses":["research"]}
+    ]
+  }'; echo
+
+say "读取事件：同批后续翻回也保留两次事件（seq 1 与 seq 2），逐条 new_event_count 均为 1"
+curl -s "$BASE/permissions/subscriptions/example-batch-sub/events?after_seq=0&limit=10"; echo
+
+say "批次幂等重试：同批次标识 + 规范化后完全相同的列表（用途换序/重复等价）-> 200 replayed=true，返回首次冻结结果且不重放事件"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "example-batch-1",
+    "changes": [
+      {"change_id":"batch-demo-c2","version_id":"batch-demo-v1","effective_at":"2026-06-01T00:00:00Z","allowed_uses":["review","research","review"]},
+      {"change_id":"batch-demo-c3","version_id":"batch-demo-v1","effective_at":"2026-08-01T08:00:00+08:00","allowed_uses":["research"]}
+    ]
+  }'; echo
+
+say "按批次标识取回首次冻结结果"
+curl -s "$BASE/license-changes/batches/example-batch-1"; echo
+
+say "批次冲突 1：同一批次标识换内容 -> 409（不应用、不重放事件）"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{"batch_id":"example-batch-1","changes":[{"change_id":"batch-demo-c9","version_id":"batch-demo-v1","effective_at":"2026-09-01T00:00:00Z","allowed_uses":["research"]}]}'; echo
+
+say "批次冲突 2：批内变更标识重复 -> 409，整批拒绝（变更与事件均不落库）"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{"batch_id":"example-batch-dup","changes":[
+    {"change_id":"dup-c","version_id":"batch-demo-v1","effective_at":"2026-04-01T00:00:00Z","allowed_uses":["research"]},
+    {"change_id":"dup-c","version_id":"batch-demo-v1","effective_at":"2026-05-01T00:00:00Z","allowed_uses":["research"]}
+  ]}'; echo
+
+say "批次错误：未知版本 -> 404，整批拒绝（连同一批中的合法变更也不落库）"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{"batch_id":"example-batch-404","changes":[
+    {"change_id":"ok-c","version_id":"batch-demo-v1","effective_at":"2026-04-01T00:00:00Z","allowed_uses":["research"]},
+    {"change_id":"ghost-c","version_id":"no-such-version","effective_at":"2026-04-01T00:00:00Z","allowed_uses":["research"]}
+  ]}'; echo
+
+say "批次错误：空列表 / 无时区时刻 -> 422，整批拒绝"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' -d '{"batch_id":"example-batch-empty","changes":[]}'; echo
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{"batch_id":"example-batch-naive","changes":[{"change_id":"naive-c","version_id":"batch-demo-v1","effective_at":"2026-04-01T00:00:00","allowed_uses":["research"]}]}'; echo
+
+say "批内重放已存变更：与已存标识内容完全相同的一条 replayed=true 且 new_event_count=0，新变更照常翻转"
+curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "example-batch-mix",
+    "changes": [
+      {"change_id":"batch-demo-c1","version_id":"batch-demo-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]},
+      {"change_id":"batch-demo-c4","version_id":"batch-demo-v1","effective_at":"2026-09-01T00:00:00Z","allowed_uses":["research","review"]}
+    ]
+  }'; echo
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 

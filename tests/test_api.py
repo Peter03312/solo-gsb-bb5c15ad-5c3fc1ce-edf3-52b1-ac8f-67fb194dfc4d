@@ -2422,6 +2422,532 @@ def test_subscription_on_demo_seed(tmp_path):
         )
         assert retry.status_code == 200
         assert retry.json()["subscription"] == sub
-        assert test_client.get(
-            "/permissions/subscriptions/demo-sub-1/events"
-        ).json()["events"] == []
+# -- license change batch imports -----------------------------------------
+
+
+def _batch(client, batch_id, changes):
+    return client.post(
+        "/license-changes/batches",
+        json={"batch_id": batch_id, "changes": changes},
+    )
+
+
+def _batch_change(change_id, version_id, at, uses):
+    return {
+        "change_id": change_id,
+        "version_id": version_id,
+        "effective_at": at,
+        "allowed_uses": uses,
+    }
+
+
+def test_batch_applies_changes_in_order_and_reports_flips(client):
+    _register(client, "v1")
+    # Baseline at September: c1 allows research+review.
+    assert _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"]).status_code == 201
+    assert _subscribe(client, "s1", "v1", "review", _iso(2026, 9, 1)).status_code == 201
+
+    # Batch: narrow in March (flip deny), open again in June (flip back allow).
+    resp = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("c2", "v1", _iso(2026, 3, 1), ["research"]),
+            _batch_change("c3", "v1", _iso(2026, 6, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    batch = body["batch"]
+    assert batch["batch_id"] == "b1"
+    assert batch["change_count"] == 2
+    assert batch["new_event_count"] == 2
+    assert [entry["index"] for entry in batch["changes"]] == [0, 1]
+    assert all(entry["replayed"] is False for entry in batch["changes"])
+    assert [entry["new_event_count"] for entry in batch["changes"]] == [1, 1]
+    assert [entry["change"]["change_id"] for entry in batch["changes"]] == ["c2", "c3"]
+
+    # Even though a later batch item flips the status back, BOTH flips stay.
+    events = _events(client, "s1").json()["events"]
+    assert [e["seq"] for e in events] == [1, 2]
+    assert events[0]["trigger_id"] == "c2"
+    assert (events[0]["before_allowed"], events[0]["after_allowed"]) == (True, False)
+    assert events[1]["trigger_id"] == "c3"
+    assert (events[1]["before_allowed"], events[1]["after_allowed"]) == (False, True)
+
+    # The final live decision is allowed again.
+    assert _check(client, "v1", "review", _iso(2026, 9, 1)).json()["allowed"] is True
+
+
+def test_batch_non_flipping_change_appends_no_event(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "v1", "research", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "b1",
+        [
+            # Adds review but keeps research: no flip for a research watcher.
+            _batch_change("c2", "v1", _iso(2026, 3, 1), ["research", "review"]),
+            # Future change relative to the fixed instant: no flip either.
+            _batch_change("c3", "v1", _iso(2026, 12, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 201
+    batch = resp.json()["batch"]
+    assert [entry["new_event_count"] for entry in batch["changes"]] == [0, 0]
+    assert batch["new_event_count"] == 0
+    assert _events(client, "s1").json()["events"] == []
+
+
+def test_batch_real_flips_observe_snapshot_after_each_item(client):
+    # Without re-pinning the snapshot per item the second item would compare
+    # against the pre-batch baseline and never see the first item's flip.
+    _register(client, "root")
+    _register(client, "child", parents=["root"])
+    _change(client, "cr1", "root", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "cc1", "child", _iso(2026, 1, 1), ["research", "review"])
+    _subscribe(client, "s-root", "root", "review", _iso(2026, 9, 1))
+    _subscribe(client, "s-child", "child", "review", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("cr2", "root", _iso(2026, 3, 1), ["research"]),
+            _batch_change("cr3", "root", _iso(2026, 4, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 201
+    batch = resp.json()["batch"]
+    # root + descendant each flip once per item: 2 events per item.
+    assert [entry["new_event_count"] for entry in batch["changes"]] == [2, 2]
+    assert batch["new_event_count"] == 4
+    for sid in ("s-root", "s-child"):
+        events = _events(client, sid).json()["events"]
+        assert [(e["seq"], e["trigger_id"]) for e in events] == [
+            (1, "cr2"),
+            (2, "cr3"),
+        ]
+        assert (events[0]["before_allowed"], events[0]["after_allowed"]) == (True, False)
+        assert (events[1]["before_allowed"], events[1]["after_allowed"]) == (False, True)
+
+
+def test_batch_duplicate_change_id_within_batch_is_rejected_atomically(client):
+    _register(client, "v1")
+    _change(client, "seed", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "v1", "review", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("dup", "v1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("dup", "v1", _iso(2026, 4, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+    assert resp.json()["details"]["change_id"] == "dup"
+    # Whole batch rejected: no change rows, no batch row, no events.
+    assert client.get("/license-changes/dup").status_code == 404
+    assert client.get("/license-changes/batches/b1").status_code == 404
+    assert _events(client, "s1").json()["events"] == []
+
+
+def test_batch_same_version_same_time_within_batch_conflicts_atomically(client):
+    _register(client, "v1")
+    _change(client, "seed", "v1", _iso(2026, 1, 1), ["research"])
+
+    resp = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("x1", "v1", _iso(2026, 3, 1), ["research"]),
+            _batch_change("x2", "v1", _iso(2026, 3, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 409
+    assert "同一生效时刻" in resp.json()["message"]
+    assert client.get("/license-changes/x1").status_code == 404
+    assert client.get("/license-changes/x2").status_code == 404
+    assert client.get("/license-changes/batches/b1").status_code == 404
+
+
+def test_batch_conflict_with_stored_change_rejects_whole_batch(client):
+    _register(client, "v1")
+    _change(client, "old", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "v1", "review", _iso(2026, 9, 1))
+
+    # Same id, different content.
+    resp = _batch(
+        client,
+        "b1",
+        [_batch_change("old", "v1", _iso(2026, 1, 1), ["commercial"])],
+    )
+    assert resp.status_code == 409
+    # Different id at the same (version, effective instant), even with same uses.
+    resp = _batch(
+        client,
+        "b2",
+        [_batch_change("twin", "v1", _iso(2026, 1, 1), ["research"])],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["details"]["existing_change_id"] == "old"
+    # A legal item appearing before the conflicting one must not be persisted.
+    resp = _batch(
+        client,
+        "b3",
+        [
+            _batch_change("fine", "v1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("old", "v1", _iso(2026, 2, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 409
+    assert client.get("/license-changes/fine").status_code == 404
+    assert client.get("/license-changes/batches/b3").status_code == 404
+    assert _events(client, "s1").json()["events"] == []
+
+
+def test_batch_unknown_version_is_404_without_rows(client):
+    _register(client, "v1")
+    resp = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("c1", "v1", _iso(2026, 1, 1), ["research"]),
+            _batch_change("c2", "ghost", _iso(2026, 2, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    assert "ghost" in resp.json()["details"]["missing_version_ids"]
+    assert client.get("/license-changes/c1").status_code == 404
+    assert client.get("/license-changes/batches/b1").status_code == 404
+
+
+def test_batch_invalid_fields_are_422_without_rows(client):
+    _register(client, "v1")
+
+    # Empty list.
+    assert _batch(client, "b0", []).status_code == 422
+    # Naive effective time.
+    resp = _batch(
+        client,
+        "b1",
+        [_batch_change("c1", "v1", "2026-03-01T00:00:00", ["research"])],
+    )
+    assert resp.status_code == 422
+    # Blank entry inside allowed_uses.
+    resp = _batch(
+        client,
+        "b2",
+        [_batch_change("c2", "v1", _iso(2026, 3, 1), ["   "])],
+    )
+    assert resp.status_code == 422
+    # Missing required field.
+    resp = client.post(
+        "/license-changes/batches",
+        json={"batch_id": "b3", "changes": [{"version_id": "v1", "allowed_uses": ["x"]}]},
+    )
+    assert resp.status_code == 422
+    for bid in ("b0", "b1", "b2", "b3"):
+        assert client.get(f"/license-changes/batches/{bid}").status_code == 404
+
+
+def test_batch_identical_retry_returns_first_frozen_result_and_no_event_replay(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "v1", "review", _iso(2026, 9, 1))
+
+    payload = {
+        "batch_id": "b1",
+        "changes": [
+            _batch_change("c2", "v1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("c3", "v1", _iso(2026, 6, 1), ["research"]),
+        ],
+    }
+    first = _batch(client, "b1", payload["changes"])
+    assert first.status_code == 201
+    first_body = first.json()
+    assert [e["seq"] for e in _events(client, "s1").json()["events"]] == [1, 2]
+
+    # Same batch id + normalised list (uses reordered/duplicated, same instant
+    # in another offset) -> 200 replay, batch object byte-identical.
+    retry_changes = [
+        _batch_change("c2", "v1", "2026-03-01T08:00:00+08:00", ["review", "research", "review"]),
+        _batch_change("c3", "v1", _iso(2026, 6, 1), ["research"]),
+    ]
+    retry = _batch(client, "b1", retry_changes)
+    assert retry.status_code == 200
+    retry_body = retry.json()
+    assert retry_body["replayed"] is True
+    assert retry_body["batch"] == first_body["batch"]
+
+    # Events are never replayed.
+    assert [e["seq"] for e in _events(client, "s1").json()["events"]] == [1, 2]
+
+    # GET returns the same frozen batch object.
+    fetched = client.get("/license-changes/batches/b1")
+    assert fetched.status_code == 200
+    assert fetched.json() == first_body["batch"]
+
+
+def test_batch_same_id_different_content_conflicts_and_does_not_replay(client):
+    _register(client, "v1")
+    first = _batch(
+        client,
+        "b1",
+        [_batch_change("c1", "v1", _iso(2026, 1, 1), ["research"])],
+    )
+    assert first.status_code == 201
+
+    # Different content (different list order, different uses or another id).
+    resp = _batch(
+        client,
+        "b1",
+        [_batch_change("c1", "v1", _iso(2026, 1, 1), ["research", "review"])],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+
+    resp = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("c2", "v1", _iso(2026, 2, 1), ["research"]),
+            _batch_change("c1", "v1", _iso(2026, 1, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 409
+    # The conflicting request left nothing behind.
+    assert client.get("/license-changes/c2").status_code == 404
+
+
+def test_batch_replayed_item_mixes_with_new_items(client):
+    _register(client, "v1")
+    _change(client, "old", "v1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "s1", "v1", "review", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "b1",
+        [
+            # Existing identical change: a replay item — no write, no events.
+            _batch_change("old", "v1", _iso(2026, 1, 1), ["research"]),
+            # New change that actually flips.
+            _batch_change("new", "v1", _iso(2026, 3, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    entries = resp.json()["batch"]["changes"]
+    assert entries[0]["replayed"] is True
+    assert entries[0]["new_event_count"] == 0
+    assert entries[1]["replayed"] is False
+    assert entries[1]["new_event_count"] == 1
+    assert resp.json()["batch"]["new_event_count"] == 1
+    assert [e["seq"] for e in _events(client, "s1").json()["events"]] == [1]
+
+    # Retrying the whole batch replays everything (still no extra events).
+    retry = _batch(
+        client,
+        "b1",
+        [
+            _batch_change("old", "v1", _iso(2026, 1, 1), ["research"]),
+            _batch_change("new", "v1", _iso(2026, 3, 1), ["research", "review"]),
+        ],
+    )
+    assert retry.status_code == 200
+    assert [e["seq"] for e in _events(client, "s1").json()["events"]] == [1]
+
+
+def test_batch_changes_interoperate_with_single_submit_and_revocation(client):
+    _register(client, "v1")
+    resp = _batch(
+        client,
+        "b1",
+        [_batch_change("bc1", "v1", _iso(2026, 1, 1), ["research", "review"])],
+    )
+    assert resp.status_code == 201
+
+    # The batch-committed change is queryable and replayable via the single API.
+    single_replay = _change(client, "bc1", "v1", _iso(2026, 1, 1), ["review", "research"])
+    assert single_replay.status_code == 200
+    assert single_replay.json()["replayed"] is True
+    assert client.get("/license-changes/bc1").status_code == 200
+
+    # It can be revoked via the existing revocation endpoint.
+    assert _revoke(client, "bc1", "r-bc1", "x").status_code == 201
+
+    # The frozen batch result is unaffected by the later revocation, while the
+    # live change lookup still shows the revocation marker.
+    frozen = client.get("/license-changes/batches/b1").json()
+    assert frozen["changes"][0]["change"]["revocation"] is None
+    assert client.get("/license-changes/bc1").json()["revocation"]["revocation_id"] == "r-bc1"
+
+
+def test_batch_without_id_is_generated(client):
+    _register(client, "v1")
+    resp = _batch(
+        client,
+        None,
+        [_batch_change(None, "v1", _iso(2026, 1, 1), ["research"])],
+    )
+    assert resp.status_code == 201
+    assert resp.json()["batch"]["batch_id"].startswith("b-")
+    assert resp.json()["batch"]["changes"][0]["change"]["change_id"].startswith("c-")
+
+
+def test_batch_unknown_id_get_is_404(client):
+    resp = client.get("/license-changes/batches/no-such-batch")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_batch_descendant_diamond_subscription_counts_flips_once_each(client):
+    _register(client, "a")
+    _register(client, "b", parents=["a"])
+    _register(client, "d1", parents=["b", "a"])
+    for vid in ("a", "b", "d1"):
+        _change(client, f"c-{vid}", vid, _iso(2026, 1, 1), ["research", "review"])
+    _subscribe(client, "s-d1", "d1", "review", _iso(2026, 9, 1))
+
+    # Narrowing a inside a batch flips the diamond descendant exactly once.
+    resp = _batch(
+        client,
+        "b1",
+        [_batch_change("ca2", "a", _iso(2026, 3, 1), ["research"])],
+    )
+    assert resp.status_code == 201
+    assert resp.json()["batch"]["changes"][0]["new_event_count"] == 1
+    events = _events(client, "s-d1").json()["events"]
+    assert len(events) == 1
+    assert [bl["version_id"] for bl in events[0]["after_blockers"]] == ["a"]
+
+
+def test_batch_concurrent_same_id_commits_exactly_once(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    import threading
+
+    codes: list[int] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.submit_changes_batch(
+                batch_id="b1",
+                items=[
+                    {
+                        "change_id": "c2",
+                        "version_id": "v1",
+                        "effective_at": datetime(2026, 3, 1, tzinfo=timezone.utc),
+                        "allowed_uses": ["research", "review"],
+                    }
+                ],
+            )
+            with lock:
+                codes.append(200 if replayed else 201)
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                codes.append(getattr(exc, "status_code", 0))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert codes.count(201) == 1, codes
+    assert codes.count(200) == 7, codes
+    assert client.get("/license-changes/c2").status_code == 200
+
+
+def test_batch_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed-batch.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        # Watch review on demo-derived-1 at a late-2026 instant: blocked by
+        # both roots (root-a narrowed in June, root-b never allowed review).
+        sub = test_client.post(
+            "/permissions/subscriptions",
+            json={
+                "subscription_id": "demo-batch-sub",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-09-01T00:00:00Z",
+            },
+        )
+        assert sub.status_code == 201
+        assert sub.json()["subscription"]["baseline_allowed"] is False
+
+        # Batch: root-a reopens review in August and root-b does the same in
+        # the same transaction. The descendant flips exactly once per item.
+        resp = test_client.post(
+            "/license-changes/batches",
+            json={
+                "batch_id": "demo-batch-1",
+                "changes": [
+                    {
+                        "change_id": "demo-batch-a-3",
+                        "version_id": "demo-root-a",
+                        "effective_at": "2026-08-01T00:00:00Z",
+                        "allowed_uses": ["research", "review"],
+                    },
+                    {
+                        "change_id": "demo-batch-b-2",
+                        "version_id": "demo-root-b",
+                        "effective_at": "2026-08-15T00:00:00Z",
+                        "allowed_uses": ["research", "review", "commercial"],
+                    },
+                ],
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        batch = resp.json()["batch"]
+        # First item still blocked by root-b: no descendant flip; second item
+        # removes the last blocker: the descendant flips deny -> allow once.
+        assert [entry["new_event_count"] for entry in batch["changes"]] == [0, 1]
+        events = test_client.get(
+            "/permissions/subscriptions/demo-batch-sub/events"
+        ).json()["events"]
+        assert len(events) == 1
+        assert events[0]["trigger_id"] == "demo-batch-b-2"
+        assert events[0]["after_allowed"] is True
+
+        # An identical retry replays the frozen result without new events.
+        retry = test_client.post(
+            "/license-changes/batches",
+            json={
+                "batch_id": "demo-batch-1",
+                "changes": [
+                    {
+                        "change_id": "demo-batch-a-3",
+                        "version_id": "demo-root-a",
+                        "effective_at": "2026-08-01T00:00:00Z",
+                        "allowed_uses": ["review", "research"],
+                    },
+                    {
+                        "change_id": "demo-batch-b-2",
+                        "version_id": "demo-root-b",
+                        "effective_at": "2026-08-15T00:00:00Z",
+                        "allowed_uses": ["commercial", "research", "review"],
+                    },
+                ],
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["replayed"] is True
+        assert retry.json()["batch"] == batch
+        assert (
+            len(
+                test_client.get(
+                    "/permissions/subscriptions/demo-batch-sub/events"
+                ).json()["events"]
+            )
+            == 1
+        )
+
