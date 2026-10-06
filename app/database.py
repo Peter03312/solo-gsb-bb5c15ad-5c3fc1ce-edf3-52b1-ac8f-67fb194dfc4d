@@ -130,6 +130,22 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (subscription_id, seq)
     )
     """,
+    # A batch import submits an ordered list of license changes under one
+    # unique batch id. The whole batch applies (or is rejected) atomically; the
+    # first result is frozen here — retrying the same batch id with the
+    # byte-identical normalised list returns it untouched (replayed=true),
+    # while a reused batch id with different content is a 409. content_hash is
+    # deliberately NOT unique: another batch id may import the same changes, in
+    # which case every entry simply replays the already-stored records.
+    """
+    CREATE TABLE IF NOT EXISTS license_change_batches (
+        batch_id     TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        change_count INTEGER NOT NULL,
+        created_at   TEXT NOT NULL,
+        result_json  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -324,6 +340,29 @@ class Database:
             "WHERE lc.version_id = ? AND lc.effective_at <= ? AND cr.change_id IS NULL "
             "ORDER BY lc.effective_at DESC, lc.change_id LIMIT 1",
             (version_id, at),
+        )
+
+    # -- license change batches ------------------------------------------
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM license_change_batches WHERE batch_id = ?",
+            (batch_id,),
+        )
+
+    def insert_batch(
+        self,
+        batch_id: str,
+        content_hash: str,
+        change_count: int,
+        created_at: str,
+        result_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO license_change_batches "
+            "(batch_id, content_hash, change_count, created_at, result_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id, content_hash, change_count, created_at, result_json),
         )
 
     # -- change revocations ----------------------------------------------

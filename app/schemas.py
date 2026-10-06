@@ -69,6 +69,36 @@ class LicenseChangeRequest(BaseModel):
         return _normalise_uses(values)
 
 
+class LicenseChangeBatchItem(LicenseChangeRequest):
+    """批次内的一条变更：批量按标识做整批校验与重试，故标识必填。
+
+    其余字段（版本、生效时刻、允许用途全集）与单条提交完全同规则。
+    """
+
+    change_id: str = Field(
+        min_length=1, max_length=128, description="该条变更的唯一标识（批次内不可重复）"
+    )
+
+
+class LicenseChangeBatchRequest(BaseModel):
+    """一次批量导入：唯一批次标识 + 非空、按请求顺序应用的变更列表。"""
+
+    batch_id: str = Field(
+        min_length=1, max_length=128, description="唯一批次标识（重试与冲突判定均以此为准）"
+    )
+    changes: list[LicenseChangeBatchItem] = Field(
+        min_length=1, description="非空有序变更列表；每条沿用单条变更的标识、版本、生效时刻与用途规则"
+    )
+
+    @field_validator("batch_id")
+    @classmethod
+    def _batch_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("batch_id 不能为空白字符串")
+        return value
+
+
 # -- responses -------------------------------------------------------------
 
 
@@ -188,6 +218,49 @@ class CreateResponse(BaseModel):
     replayed: bool
     change: LicenseChangeResponse | None = None
     version: VersionResponse | None = None
+
+
+# -- license change batches ------------------------------------------------
+
+
+class BatchEventRef(BaseModel):
+    """一条变更真实翻转某个订阅的事件引用（详情可用事件游标按订阅读取）。"""
+
+    subscription_id: str = Field(description="被翻转订阅的标识")
+    version_id: str = Field(description="该订阅关注的版本")
+    use: str = Field(description="该订阅关注的用途")
+    seq: int = Field(description="在该订阅内追加的事件序号（从 1 严格递增）")
+    before_allowed: bool = Field(description="本条变更应用前的允许状态")
+    after_allowed: bool = Field(description="本条变更应用后的允许状态")
+
+
+class BatchChangeResult(BaseModel):
+    """批次内一条变更的应用结果。"""
+
+    position: int = Field(description="该条在请求列表中的从 0 起位置（即应用顺序）")
+    replayed: bool = Field(
+        description="该变更是否以相同标识与内容在本批之前已存在（幂等重放，不产生事件）"
+    )
+    change: LicenseChangeResponse
+    new_event_count: int = Field(
+        default=0, description="应用该条时新增的翻转事件数（真实翻转才追加）"
+    )
+    new_events: list[BatchEventRef] = Field(
+        default_factory=list,
+        description="应用该条时真实翻转并在订阅内追加的事件（翻回也各自保留）",
+    )
+
+
+class LicenseChangeBatchResponse(BaseModel):
+    batch_id: str = Field(description="唯一批次标识")
+    replayed: bool = Field(
+        description="同批次标识与规范化后完全相同的列表重试时为 true，返回首次冻结结果"
+    )
+    content_hash: str = Field(description="规范化后有序变更列表的稳定哈希（重试据此判同）")
+    created_at: datetime = Field(description="批次首次落库时间（服务按 UTC 生成）")
+    changes: list[BatchChangeResult] = Field(
+        description="按请求顺序逐条应用的结果，含每条新增事件"
+    )
 
 
 # -- permission vouchers ---------------------------------------------------

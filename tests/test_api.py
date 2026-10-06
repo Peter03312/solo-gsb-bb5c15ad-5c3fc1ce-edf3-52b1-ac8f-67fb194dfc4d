@@ -2425,3 +2425,399 @@ def test_subscription_on_demo_seed(tmp_path):
         assert test_client.get(
             "/permissions/subscriptions/demo-sub-1/events"
         ).json()["events"] == []
+
+
+# -- license change batches -----------------------------------------------
+
+
+def _batch(client, batch_id, changes):
+    return client.post(
+        "/license-changes/batch",
+        json={"batch_id": batch_id, "changes": changes},
+    )
+
+
+def _batch_change(change_id, version_id, at, uses):
+    return {
+        "change_id": change_id,
+        "version_id": version_id,
+        "effective_at": at,
+        "allowed_uses": uses,
+    }
+
+
+def test_batch_applies_entries_in_order_and_reports_each_flip(client):
+    _register(client, "bv1")
+    _change(client, "bc1", "bv1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "bsub", "bv1", "review", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "batch-1",
+        [
+            _batch_change("bc2", "bv1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("bc3", "bv1", _iso(2026, 6, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    assert body["batch_id"] == "batch-1"
+    assert [c["position"] for c in body["changes"]] == [0, 1]
+    assert [c["change"]["change_id"] for c in body["changes"]] == ["bc2", "bc3"]
+    assert [c["replayed"] for c in body["changes"]] == [False, False]
+
+    # Entry 1 flips deny -> allow (one event), entry 2 flips allow -> deny.
+    first, second = body["changes"]
+    assert first["new_event_count"] == 1
+    assert second["new_event_count"] == 1
+    ref1 = first["new_events"][0]
+    assert ref1 == {
+        "subscription_id": "bsub",
+        "version_id": "bv1",
+        "use": "review",
+        "seq": 1,
+        "before_allowed": False,
+        "after_allowed": True,
+    }
+    assert second["new_events"][0]["seq"] == 2
+    assert second["new_events"][0]["before_allowed"] is True
+    assert second["new_events"][0]["after_allowed"] is False
+
+    # Both flips are retained in the subscription stream, including the flip back.
+    events = _events(client, "bsub").json()["events"]
+    assert [e["seq"] for e in events] == [1, 2]
+    assert events[0]["trigger_id"] == "bc2" and events[1]["trigger_id"] == "bc3"
+
+    # GET by batch id returns the frozen first result.
+    fetched = client.get("/license-changes/batch/batch-1")
+    assert fetched.status_code == 200
+    assert fetched.json()["changes"][0]["new_events"][0]["seq"] == 1
+
+
+def test_batch_retry_identical_normalised_list_returns_first_result(client):
+    _register(client, "bv1")
+    _change(client, "bc1", "bv1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "bsub", "bv1", "review", _iso(2026, 9, 1))
+
+    payload = [
+        _batch_change("bc2", "bv1", _iso(2026, 3, 1), ["research", "review"]),
+        _batch_change("bc3", "bv1", _iso(2026, 6, 1), ["research"]),
+    ]
+    first = _batch(client, "batch-retry", payload)
+    assert first.status_code == 201
+    first_body = first.json()
+    assert [c["new_event_count"] for c in first_body["changes"]] == [1, 1]
+
+    # Same batch id, byte-different but semantically identical normalised list:
+    # reordered/duplicate allowed uses, a +08:00 spelling of the same instant.
+    retried = _batch(
+        client,
+        "batch-retry",
+        [
+            _batch_change("bc2", "bv1", "2026-03-01T08:00:00+08:00", ["review", "research", "research"]),
+            _batch_change("bc3", "bv1", _iso(2026, 6, 1), ["research"]),
+        ],
+    )
+    assert retried.status_code == 200
+    retry_body = retried.json()
+    assert retry_body["replayed"] is True
+    assert retry_body["content_hash"] == first_body["content_hash"]
+    assert retry_body["created_at"] == first_body["created_at"]
+    assert retry_body["changes"] == first_body["changes"]
+
+    # Events are not replayed on retry.
+    assert [e["seq"] for e in _events(client, "bsub").json()["events"]] == [1, 2]
+
+
+def test_batch_same_id_different_content_conflicts_and_changes_nothing(client):
+    _register(client, "bv1")
+    _change(client, "bc1", "bv1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "bsub", "bv1", "review", _iso(2026, 9, 1))
+
+    first = _batch(
+        client,
+        "batch-x",
+        [_batch_change("bc2", "bv1", _iso(2026, 3, 1), ["research", "review"])],
+    )
+    assert first.status_code == 201
+
+    # Reusing the batch id with a different list is a 409 and replays no events.
+    conflict = _batch(
+        client,
+        "batch-x",
+        [_batch_change("bc2", "bv1", _iso(2026, 3, 1), ["commercial"])],
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"] == "conflict"
+    # Original frozen result stays retrievable and the stream is untouched.
+    assert client.get("/license-changes/batch/batch-x").json()["changes"][0][
+        "new_event_count"
+    ] == 1
+    assert [e["seq"] for e in _events(client, "bsub").json()["events"]] == [1]
+
+
+def test_batch_duplicate_change_ids_within_batch_whole_batch_rejected(client):
+    _register(client, "bv1")
+    _subscribe(client, "bsub", "bv1", "research", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "batch-dup",
+        [
+            _batch_change("dup", "bv1", _iso(2026, 3, 1), ["research"]),
+            _batch_change("dup", "bv1", _iso(2026, 4, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+
+    # Nothing landed: no batch row, no change rows, no events.
+    assert client.get("/license-changes/batch/batch-dup").status_code == 404
+    assert client.get("/license-changes/dup").status_code == 404
+    assert _events(client, "bsub").json()["events"] == []
+
+
+def test_batch_unknown_version_whole_batch_rejected(client):
+    _register(client, "bv1")
+    resp = _batch(
+        client,
+        "batch-404",
+        [
+            _batch_change("ok", "bv1", _iso(2026, 3, 1), ["research"]),
+            _batch_change("bad", "ghost-version", _iso(2026, 4, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    assert client.get("/license-changes/ok").status_code == 404
+    assert client.get("/license-changes/batch/batch-404").status_code == 404
+
+
+def test_batch_conflict_with_existing_change_whole_batch_rejected(client):
+    _register(client, "bv1")
+    _change(client, "old", "bv1", _iso(2026, 3, 1), ["research"])
+    _subscribe(client, "bsub", "bv1", "review", _iso(2026, 9, 1))
+
+    # Same change id, different content -> 409, and the second (new) entry is
+    # not applied either.
+    resp = _batch(
+        client,
+        "batch-c1",
+        [
+            _batch_change("old", "bv1", _iso(2026, 3, 1), ["commercial"]),
+            _batch_change("new", "bv1", _iso(2026, 5, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 409
+    assert client.get("/license-changes/new").status_code == 404
+    assert _events(client, "bsub").json()["events"] == []
+
+    # A different change id at an already occupied (version, instant) -> 409.
+    resp2 = _batch(
+        client,
+        "batch-c2",
+        [_batch_change("twin", "bv1", _iso(2026, 3, 1), ["research"])],
+    )
+    assert resp2.status_code == 409
+    assert client.get("/license-changes/twin").status_code == 404
+
+    # Same (version, instant) twice inside one batch -> 409 as well.
+    resp3 = _batch(
+        client,
+        "batch-c3",
+        [
+            _batch_change("x1", "bv1", _iso(2026, 7, 1), ["research"]),
+            _batch_change("x2", "bv1", _iso(2026, 7, 1), ["research"]),
+        ],
+    )
+    assert resp3.status_code == 409
+    assert client.get("/license-changes/x1").status_code == 404
+    assert client.get("/license-changes/x2").status_code == 404
+
+
+def test_batch_invalid_fields_are_422_and_write_nothing(client):
+    _register(client, "bv1")
+
+    # Empty change list.
+    assert _batch(client, "b-empty", []).status_code == 422
+    # Missing batch id.
+    resp = client.post(
+        "/license-changes/batch",
+        json={"changes": [_batch_change("c", "bv1", _iso(2026, 3, 1), ["research"])]},
+    )
+    assert resp.status_code == 422
+    # A batch entry must carry an explicit change id (used for whole-batch
+    # validation and idempotent retries); omission is rejected, not generated.
+    resp = client.post(
+        "/license-changes/batch",
+        json={
+            "batch_id": "b-no-cid",
+            "changes": [
+                {
+                    "version_id": "bv1",
+                    "effective_at": _iso(2026, 3, 1),
+                    "allowed_uses": ["research"],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    assert client.get("/license-changes/batch/b-no-cid").status_code == 404
+    # Blank/whitespace allowed use.
+    resp = _batch(
+        client,
+        "b-blank",
+        [_batch_change("c", "bv1", _iso(2026, 3, 1), ["   "])],
+    )
+    assert resp.status_code == 422
+    # Naive effective time.
+    resp = _batch(
+        client,
+        "b-naive",
+        [_batch_change("c", "bv1", "2026-03-01T00:00:00", ["research"])],
+    )
+    assert resp.status_code == 422
+
+    assert client.get("/license-changes/c").status_code == 404
+    assert client.get("/license-changes/batch/b-empty").status_code == 404
+
+
+def test_batch_replay_entry_does_not_repropagate_events(client):
+    _register(client, "bv1")
+    _change(client, "bc1", "bv1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "bsub", "bv1", "review", _iso(2026, 9, 1))
+    # bc2 was already committed (and already flipped the subscription once).
+    assert _change(
+        client, "bc2", "bv1", _iso(2026, 3, 1), ["research", "review"]
+    ).status_code == 201
+    assert [e["seq"] for e in _events(client, "bsub").json()["events"]] == [1]
+
+    # A batch that replays bc2 and then adds bc3: the replay entry reports
+    # replayed=true with zero events; only bc3 flips.
+    resp = _batch(
+        client,
+        "batch-mix",
+        [
+            _batch_change("bc2", "bv1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("bc3", "bv1", _iso(2026, 6, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    changes = resp.json()["changes"]
+    assert changes[0]["replayed"] is True and changes[0]["new_event_count"] == 0
+    assert changes[1]["replayed"] is False and changes[1]["new_event_count"] == 1
+    assert [e["seq"] for e in _events(client, "bsub").json()["events"]] == [1, 2]
+
+
+def test_batch_flip_out_and_back_keeps_both_events(client):
+    _register(client, "bv1")
+    _change(client, "bc1", "bv1", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "bsub", "bv1", "review", _iso(2026, 9, 1))
+
+    # Open review in March then close it again in May inside one batch: even
+    # though the final state equals the initial state, two events are kept.
+    resp = _batch(
+        client,
+        "batch-outback",
+        [
+            _batch_change("open", "bv1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("shut", "bv1", _iso(2026, 5, 1), ["research"]),
+        ],
+    )
+    assert resp.status_code == 201
+    counts = [c["new_event_count"] for c in resp.json()["changes"]]
+    assert counts == [1, 1]
+    events = _events(client, "bsub").json()["events"]
+    assert [(e["before_allowed"], e["after_allowed"]) for e in events] == [
+        (False, True),
+        (True, False),
+    ]
+
+
+def test_batch_entries_without_flip_report_zero_events(client):
+    _register(client, "bv1")
+    _change(client, "bc1", "bv1", _iso(2026, 1, 1), ["research"])
+    # Watches research: adding review never flips the research decision.
+    _subscribe(client, "bsub", "bv1", "research", _iso(2026, 9, 1))
+
+    resp = _batch(
+        client,
+        "batch-noflip",
+        [
+            _batch_change("bc2", "bv1", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("bc3", "bv1", _iso(2026, 6, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 201
+    assert [c["new_event_count"] for c in resp.json()["changes"]] == [0, 0]
+    assert _events(client, "bsub").json()["events"] == []
+
+
+def test_batch_propagates_to_descendant_subscriptions(client):
+    _register(client, "root")
+    _register(client, "child", parents=["root"])
+    _change(client, "cr1", "root", _iso(2026, 1, 1), ["research"])
+    _change(client, "cc1", "child", _iso(2026, 1, 1), ["research"])
+    _subscribe(client, "sroot", "root", "review", _iso(2026, 9, 1))
+    _subscribe(client, "schild", "child", "review", _iso(2026, 9, 1))
+
+    # Relaxing the child alone flips nothing: the child's closure still
+    # includes root, whose January change denies review. Relaxing root in the
+    # second entry then flips both subscriptions at once from the cumulative
+    # snapshot — ancestor (root) and descendant (child).
+    resp = _batch(
+        client,
+        "batch-desc",
+        [
+            _batch_change("cc2", "child", _iso(2026, 3, 1), ["research", "review"]),
+            _batch_change("cr2", "root", _iso(2026, 4, 1), ["research", "review"]),
+        ],
+    )
+    assert resp.status_code == 201
+    entry1, entry2 = resp.json()["changes"]
+    assert entry1["new_event_count"] == 0
+    assert {e["subscription_id"] for e in entry2["new_events"]} == {"sroot", "schild"}
+    assert [e["seq"] for e in _events(client, "sroot").json()["events"]] == [1]
+    assert [e["seq"] for e in _events(client, "schild").json()["events"]] == [1]
+
+
+def test_batch_get_unknown_is_404(client):
+    assert client.get("/license-changes/batch/no-such-batch").status_code == 404
+
+
+def test_batch_normalises_uses_order_and_duplicates(client):
+    _register(client, "bv1")
+    resp = _batch(
+        client,
+        "batch-norm",
+        [
+            _batch_change(
+                "cn", "bv1", _iso(2026, 3, 1), [" review", "research ", "research", ""]
+            )
+        ],
+    )
+    # Pydantic rejects the empty string before the service is reached.
+    assert resp.status_code == 422
+
+    # Duplicate/whitespace-padded but otherwise valid uses are normalised: the
+    # stored change carries the trimmed, deduplicated set.
+    ok = _batch(
+        client,
+        "batch-norm",
+        [
+            _batch_change(
+                "cn", "bv1", _iso(2026, 3, 1), [" review", "research ", "research"]
+            )
+        ],
+    )
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["changes"][0]["change"]["allowed_uses"] == ["research", "review"]
+
+    # Replaying with the canonical spelling returns the frozen result.
+    replay = _batch(
+        client,
+        "batch-norm",
+        [_batch_change("cn", "bv1", _iso(2026, 3, 1), ["research", "review"])],
+    )
+    assert replay.status_code == 200 and replay.json()["replayed"] is True
